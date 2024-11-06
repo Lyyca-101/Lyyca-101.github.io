@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    
+    <link rel="icon" href="https://github.githubassets.com/favicons/favicon.svg"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="<h2>[OSDI2014]Pelican[COLON] A Building Block for Exascale Cold Data Storage</h2>
+
+建议去USENIX看看这篇paper的presentation和slides
+
+对'cold data'的描述是云存储中很少访问的数据，这类数据占了相当大的比例
+
+- pelican是面向EB级冷数据存储、基于磁盘的机架级存储单元
+- 将访问不频繁的数据存储在早期的基于磁盘的云存储中，是昂贵的，因为这些磁盘的配置基于热数据的工作负载，使用的配置提供低访问延迟以达到顶峰性能(peak performance，这会导致机架的上行链路带宽被完全充满，完全利用)，为了达到这一点，会有大量的供电、冷却和服务器支持，这带来了很大的成本开销，，如何为这类数据设计高性价比的存储成为一个挑战
+- pelican的原型能够存储超过5PB的原始数据(raw data)
+- pelican被设计为仅支持冷数据工作负载，每PB提供的峰值持续读取速度为1GB/PB/s
+- 通过精心设计的软件栈使得pelican能够在仅有8%磁盘工作的时候仍能够满足冷数据工作负载的需求
+- right-provisioning，一个刚好能够满足冷数据工作负载(如何分析负载得到的配置)的硬件配置
+  - 根据冷数据的访问模式(写一次，很少读write once rarely read)，不需要所有的磁盘都同时工作来提供高性能，那么为了高性能而设置的大量供电、冷却、服务器设施就是不必要的了
+  - 大量的电力供应、冷却机构、服务器被移除，使得这些硬件只占用机架极少一部分的空间，从而使得52U的机架能够放置1152个磁盘
+  - 只有2个server进行管理
+  - 上行带宽为4*10Gbps
+  - 磁盘也是Archival级别的，不是commodity级别，这种磁盘对spin-up延迟和容量作了优化
+  - right-provisioning削减了大量的硬件资源，这导致的结果是，并非所有的磁盘都能在任何时候启动
+  - 实际上，冷却机构只能让8%磁盘同时旋转，如果超过，就会导致有的磁盘过热从而影响使用寿命
+  - 存储系统的配置下，冷却机构只能让96个磁盘同时转动(一共1152个磁盘，机架大小为52U，~22disks/U)
+  - right-provisioning虽然减少了成本，增加了存储密度，但是硬件资源的减少带来了明显的资源约束问题，作者将会采用软件的方法进行解决
+
+- pelican将大量的磁盘分成磁盘组管理，对于1152个磁盘，分成48个磁盘组进行管理，组内的磁盘接受同样的磁盘物理约束(电力、带宽、冷却、故障域等)，在同一个组的磁盘会同时启动
+- pelican通过分组进行数据布局和IO调度
+
+第2节提供Pelican硬件的概述，并描述数据布局和I/O调度器，但在讨论硬件结构之后、数据布局之前，作者首先详细定义了资源约束，然后再将layout和I/O schedule是如何解决资源约束问题的
+
+资源约束：
+
+- 对活动磁盘组的约束
+- 定义了资源域(resource domain)，有四种：power cooling vibration bandwidth
+- paper里的图为了简单展示，没有呈现vibration domain和bandwidth domain
+- power domain：16个中的2个disks可以活动
+- cooling domain: 12个中的1个disk可以活动
+- vibration domain：2个中的1个disk可以活动
+
+在这样的资源约束下，数据布局，或者说数据放置的目标是最大化请求的并发度，也就是说，对于到达的请求，让尽可能多的请求能够被同时服务，冲突感知的数据放置
+
+- 数据被按blob组织，一个blob被存入pelican时，会使用纠删码进行编码，并且blob会被均分成多个片段(fragment)存到一组磁盘中(stripe)
+- 这些片段所在的一组磁盘被要求能够同时活动，以最大化IO性能
+- 让任意两组磁盘组同时活动，在硬件资源丰富的系统，是没有问题的
+- 但是在pelican的right-provisioning的系统中，由于硬件资源紧缺，两组磁盘组可能会发生资源上的竞争(供电不够用、冷却不够用等)，比如这两组磁盘中的某两个disk的资源域重叠(在同一列的disks，发生冷却资源的竞争)
+- 因此需要最小化资源冲突的概率
+- 考虑一个blob经过编码产生n段放置到n个磁盘，如果随机放置，那么对于下一个要放置到n个磁盘的blob，发生冲突的概率符合O(n^2^)
+- 让冲突在组与组之间发生
+- 组与组之间要么完全冲突，要么完全不冲突
+- 完全冲突的组组成的集合，称为class
+- 静态地将磁盘分成组，通过按对角线分(paper有图)，这样能保证组内的每个disk都在单独的power domain和cooling domain，这样组内的disk不会发生资源冲突，只有可能组与组之间发生冲突
+- 这使得冲突的概率变成符合O(n)
+- pelican设置1个组有24个disks，对于1152个磁盘，有48个组，形成4个class，每个class有12个组，在不同class的组不会发生资源冲突，所以系统的并发度是4，也就是说，如果有4个对不同class上的请求，它们能够被同时服务
+- 需要注意，paper声称pelican只是EB级冷数据存储的building block，这意味着实际部署的时候，必定是部署大量的pelican机架，而不是只有一台。">
+<meta property="og:title" content="Pelican:A Building Block for Exascale Cold Data Storage[OSDI2014]">
+<meta property="og:description" content="<h2>[OSDI2014]Pelican[COLON] A Building Block for Exascale Cold Data Storage</h2>
+
+建议去USENIX看看这篇paper的presentation和slides
+
+对'cold data'的描述是云存储中很少访问的数据，这类数据占了相当大的比例
+
+- pelican是面向EB级冷数据存储、基于磁盘的机架级存储单元
+- 将访问不频繁的数据存储在早期的基于磁盘的云存储中，是昂贵的，因为这些磁盘的配置基于热数据的工作负载，使用的配置提供低访问延迟以达到顶峰性能(peak performance，这会导致机架的上行链路带宽被完全充满，完全利用)，为了达到这一点，会有大量的供电、冷却和服务器支持，这带来了很大的成本开销，，如何为这类数据设计高性价比的存储成为一个挑战
+- pelican的原型能够存储超过5PB的原始数据(raw data)
+- pelican被设计为仅支持冷数据工作负载，每PB提供的峰值持续读取速度为1GB/PB/s
+- 通过精心设计的软件栈使得pelican能够在仅有8%磁盘工作的时候仍能够满足冷数据工作负载的需求
+- right-provisioning，一个刚好能够满足冷数据工作负载(如何分析负载得到的配置)的硬件配置
+  - 根据冷数据的访问模式(写一次，很少读write once rarely read)，不需要所有的磁盘都同时工作来提供高性能，那么为了高性能而设置的大量供电、冷却、服务器设施就是不必要的了
+  - 大量的电力供应、冷却机构、服务器被移除，使得这些硬件只占用机架极少一部分的空间，从而使得52U的机架能够放置1152个磁盘
+  - 只有2个server进行管理
+  - 上行带宽为4*10Gbps
+  - 磁盘也是Archival级别的，不是commodity级别，这种磁盘对spin-up延迟和容量作了优化
+  - right-provisioning削减了大量的硬件资源，这导致的结果是，并非所有的磁盘都能在任何时候启动
+  - 实际上，冷却机构只能让8%磁盘同时旋转，如果超过，就会导致有的磁盘过热从而影响使用寿命
+  - 存储系统的配置下，冷却机构只能让96个磁盘同时转动(一共1152个磁盘，机架大小为52U，~22disks/U)
+  - right-provisioning虽然减少了成本，增加了存储密度，但是硬件资源的减少带来了明显的资源约束问题，作者将会采用软件的方法进行解决
+
+- pelican将大量的磁盘分成磁盘组管理，对于1152个磁盘，分成48个磁盘组进行管理，组内的磁盘接受同样的磁盘物理约束(电力、带宽、冷却、故障域等)，在同一个组的磁盘会同时启动
+- pelican通过分组进行数据布局和IO调度
+
+第2节提供Pelican硬件的概述，并描述数据布局和I/O调度器，但在讨论硬件结构之后、数据布局之前，作者首先详细定义了资源约束，然后再将layout和I/O schedule是如何解决资源约束问题的
+
+资源约束：
+
+- 对活动磁盘组的约束
+- 定义了资源域(resource domain)，有四种：power cooling vibration bandwidth
+- paper里的图为了简单展示，没有呈现vibration domain和bandwidth domain
+- power domain：16个中的2个disks可以活动
+- cooling domain: 12个中的1个disk可以活动
+- vibration domain：2个中的1个disk可以活动
+
+在这样的资源约束下，数据布局，或者说数据放置的目标是最大化请求的并发度，也就是说，对于到达的请求，让尽可能多的请求能够被同时服务，冲突感知的数据放置
+
+- 数据被按blob组织，一个blob被存入pelican时，会使用纠删码进行编码，并且blob会被均分成多个片段(fragment)存到一组磁盘中(stripe)
+- 这些片段所在的一组磁盘被要求能够同时活动，以最大化IO性能
+- 让任意两组磁盘组同时活动，在硬件资源丰富的系统，是没有问题的
+- 但是在pelican的right-provisioning的系统中，由于硬件资源紧缺，两组磁盘组可能会发生资源上的竞争(供电不够用、冷却不够用等)，比如这两组磁盘中的某两个disk的资源域重叠(在同一列的disks，发生冷却资源的竞争)
+- 因此需要最小化资源冲突的概率
+- 考虑一个blob经过编码产生n段放置到n个磁盘，如果随机放置，那么对于下一个要放置到n个磁盘的blob，发生冲突的概率符合O(n^2^)
+- 让冲突在组与组之间发生
+- 组与组之间要么完全冲突，要么完全不冲突
+- 完全冲突的组组成的集合，称为class
+- 静态地将磁盘分成组，通过按对角线分(paper有图)，这样能保证组内的每个disk都在单独的power domain和cooling domain，这样组内的disk不会发生资源冲突，只有可能组与组之间发生冲突
+- 这使得冲突的概率变成符合O(n)
+- pelican设置1个组有24个disks，对于1152个磁盘，有48个组，形成4个class，每个class有12个组，在不同class的组不会发生资源冲突，所以系统的并发度是4，也就是说，如果有4个对不同class上的请求，它们能够被同时服务
+- 需要注意，paper声称pelican只是EB级冷数据存储的building block，这意味着实际部署的时候，必定是部署大量的pelican机架，而不是只有一台。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://Lyyca-101.github.io/post/Pelican-A%20Building%20Block%20for%20Exascale%20Cold%20Data%20Storage%5BOSDI2014%5D.html">
+<meta property="og:image" content="https://github.githubassets.com/favicons/favicon.svg">
+<title>Pelican:A Building Block for Exascale Cold Data Storage[OSDI2014]</title>
+
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">Pelican:A Building Block for Exascale Cold Data Storage[OSDI2014]</h1>
+<div class="title-right">
+    <a href="https://Lyyca-101.github.io" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/Lyyca-101/Lyyca-101.github.io/issues/2" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><h2>[OSDI2014]Pelican[COLON] A Building Block for Exascale Cold Data Storage</h2>
+<p>建议去USENIX看看这篇paper的presentation和slides</p>
+<p>对"cold data"的描述是云存储中很少访问的数据，这类数据占了相当大的比例</p>
+<ul>
+<li>
+<p>pelican是面向EB级冷数据存储、基于磁盘的机架级存储单元</p>
+</li>
+<li>
+<p>将访问不频繁的数据存储在早期的基于磁盘的云存储中，是昂贵的，因为这些磁盘的配置基于热数据的工作负载，使用的配置提供低访问延迟以达到顶峰性能(peak performance，这会导致机架的上行链路带宽被完全充满，完全利用)，为了达到这一点，会有大量的供电、冷却和服务器支持，这带来了很大的成本开销，，如何为这类数据设计高性价比的存储成为一个挑战</p>
+</li>
+<li>
+<p>pelican的原型能够存储超过5PB的原始数据(raw data)</p>
+</li>
+<li>
+<p>pelican被设计为仅支持冷数据工作负载，每PB提供的峰值持续读取速度为1GB/PB/s</p>
+</li>
+<li>
+<p>通过精心设计的软件栈使得pelican能够在仅有8%磁盘工作的时候仍能够满足冷数据工作负载的需求</p>
+</li>
+<li>
+<p>right-provisioning，一个刚好能够满足冷数据工作负载(如何分析负载得到的配置)的硬件配置</p>
+<ul>
+<li>根据冷数据的访问模式(写一次，很少读write once rarely read)，不需要所有的磁盘都同时工作来提供高性能，那么为了高性能而设置的大量供电、冷却、服务器设施就是不必要的了</li>
+<li>大量的电力供应、冷却机构、服务器被移除，使得这些硬件只占用机架极少一部分的空间，从而使得52U的机架能够放置1152个磁盘</li>
+<li>只有2个server进行管理</li>
+<li>上行带宽为4*10Gbps</li>
+<li>磁盘也是Archival级别的，不是commodity级别，这种磁盘对spin-up延迟和容量作了优化</li>
+<li>right-provisioning削减了大量的硬件资源，这导致的结果是，并非所有的磁盘都能在任何时候启动</li>
+<li>实际上，冷却机构只能让8%磁盘同时旋转，如果超过，就会导致有的磁盘过热从而影响使用寿命</li>
+<li>存储系统的配置下，冷却机构只能让96个磁盘同时转动(一共1152个磁盘，机架大小为52U，~22disks/U)</li>
+<li>right-provisioning虽然减少了成本，增加了存储密度，但是硬件资源的减少带来了明显的资源约束问题，作者将会采用软件的方法进行解决</li>
+</ul>
+</li>
+<li>
+<p>pelican将大量的磁盘分成磁盘组管理，对于1152个磁盘，分成48个磁盘组进行管理，组内的磁盘接受同样的磁盘物理约束(电力、带宽、冷却、故障域等)，在同一个组的磁盘会同时启动</p>
+</li>
+<li>
+<p>pelican通过分组进行数据布局和IO调度</p>
+</li>
+</ul>
+<p>第2节提供Pelican硬件的概述，并描述数据布局和I/O调度器，但在讨论硬件结构之后、数据布局之前，作者首先详细定义了资源约束，然后再将layout和I/O schedule是如何解决资源约束问题的</p>
+<p>资源约束：</p>
+<ul>
+<li>对活动磁盘组的约束</li>
+<li>定义了资源域(resource domain)，有四种：power cooling vibration bandwidth</li>
+<li>paper里的图为了简单展示，没有呈现vibration domain和bandwidth domain</li>
+<li>power domain：16个中的2个disks可以活动</li>
+<li>cooling domain: 12个中的1个disk可以活动</li>
+<li>vibration domain：2个中的1个disk可以活动</li>
+</ul>
+<p>在这样的资源约束下，数据布局，或者说数据放置的目标是最大化请求的并发度，也就是说，对于到达的请求，让尽可能多的请求能够被同时服务，冲突感知的数据放置</p>
+<ul>
+<li>数据被按blob组织，一个blob被存入pelican时，会使用纠删码进行编码，并且blob会被均分成多个片段(fragment)存到一组磁盘中(stripe)</li>
+<li>这些片段所在的一组磁盘被要求能够同时活动，以最大化IO性能</li>
+<li>让任意两组磁盘组同时活动，在硬件资源丰富的系统，是没有问题的</li>
+<li>但是在pelican的right-provisioning的系统中，由于硬件资源紧缺，两组磁盘组可能会发生资源上的竞争(供电不够用、冷却不够用等)，比如这两组磁盘中的某两个disk的资源域重叠(在同一列的disks，发生冷却资源的竞争)</li>
+<li>因此需要最小化资源冲突的概率</li>
+<li>考虑一个blob经过编码产生n段放置到n个磁盘，如果随机放置，那么对于下一个要放置到n个磁盘的blob，发生冲突的概率符合O(n^2^)</li>
+<li>让冲突在组与组之间发生</li>
+<li>组与组之间要么完全冲突，要么完全不冲突</li>
+<li>完全冲突的组组成的集合，称为class</li>
+<li>静态地将磁盘分成组，通过按对角线分(paper有图)，这样能保证组内的每个disk都在单独的power domain和cooling domain，这样组内的disk不会发生资源冲突，只有可能组与组之间发生冲突</li>
+<li>这使得冲突的概率变成符合O(n)</li>
+<li>pelican设置1个组有24个disks，对于1152个磁盘，有48个组，形成4个class，每个class有12个组，在不同class的组不会发生资源冲突，所以系统的并发度是4，也就是说，如果有4个对不同class上的请求，它们能够被同时服务</li>
+<li>需要注意，paper声称pelican只是EB级冷数据存储的building block，这意味着实际部署的时候，必定是部署大量的pelican机架，而不是只有一台。实际上，作为microsoft的一个计划，project pelican后续的工作是把这种机架集成到microsoft的Azure云存储的冷数据存储层中</li>
+<li>组内的18个磁盘用来存一个blob，而一个组有24个磁盘，这样，即使组内有磁盘损坏，仍然有可能在组内找到18个磁盘来存blob</li>
+<li>通过组封装了约束，也就是说，当我想知道哪些blob请求可以并发时，只需要看这些blob是否在同一个class，如果在，则不能并发，否则能并发</li>
+</ul>
+<p>对于IO调度器来说，问题在于怎么去减少spin up latency的影响</p>
+<ul>
+<li>IO调度器采用均摊spin up latency的思路</li>
+<li>均摊的方式是把操作组织成一个组来把spin up latency均分到每个操作上</li>
+</ul>
+<p>评估使用的指标：</p>
+<ul>
+<li>completion time：指的是从客户端发出请求到最后一个数据字节被发送到客户端之间的时间。这个指标包括排队延迟、磁盘启动延迟、读取和传输数据的时间</li>
+<li>time to first byte：指的是从客户端发出请求到第一个数据字节被发送到客户端之间的时间。该指标包括排队延迟和任何磁盘启动与卷挂载的延迟</li>
+<li>service time：从调度器将请求出队列到与该请求相关的最后一个字节被传输的时间。该指标包括磁盘启动延迟和数据传输时间，但不包括排队延迟</li>
+<li>average reject time：这些实验使用开放回路工作负载；当提供的负载超过 Pelican 或 FP 系统的服务能力时，一旦调度器的队列满了，请求将被拒绝。此指标衡量被拒绝的请求比例。网卡（NIC）在 40 Gbps 的情况下以每秒 5 个请求成为瓶颈。因此，在所有实验中，除非另有说明，我们将实验速率设定为每秒 8 个请求。</li>
+<li>throughput：即机架网络的平均吞吐量，计算方法为实验期间通过网络链接传输的总字节数除以实验持续时间</li>
+</ul>
+<p><a target="_blank" rel="noopener noreferrer" href="https://github.com/user-attachments/assets/6093ea50-3e98-4aec-b00a-3280eb1d4ae5"><img src="https://github.com/user-attachments/assets/6093ea50-3e98-4aec-b00a-3280eb1d4ae5" alt="time drawio" style="max-width: 100%;"></a></p>
+<p>作者在USENIX做presentation的时候被MAID作者的学生问到了有关MAID的问题：</p>
+<p>为什么你做的东西和我导师02年做的MAID很相似？</p>
+<p>作者没有在presentation上直接回答，只是说pelican独特之处在于根据cold storage workload的要求做了right provisioning保证性价比并通过软件栈(mainly,data layout+IO scheduler)解决了由此引发的问题</p>
+<p>第二个问题，来自其他人：</p>
+<p>据他所知，磁盘工作到一定次数的周期就坏了，如果每天spin up and down一百多次，大概1年半就磁盘就坏了，这会导致在读取之前磁盘已经不可用</p>
+<p>作者给出的回答是这些磁盘为archival storage进行专门的硬件硬件优化，对spin-up和spin-down的周期次数做了优化，是manageable的，至于有关工作次数/寿命相关参数的spec，it's confidential</p>
+<p>关于pelican使用的archival disk，详见</p>
+<p>[<em>8th USENIX Workshop on Hot Topics in Storage and File Systems (HotStorage 16)</em>]</p>
+<p>Feeding the Pelican: Using Archival Hard Drives for Cold Storage Racks</p>
+<p><a href="https://www.computerweekly.com/blog/StorageBuzz/Microsoft-revives-MAID-with-Pelican-but-tape-can-still-sleep-easy" rel="nofollow"></a><a href="https://www.computerweekly.com/blog/StorageBuzz/Microsoft-revives-MAID-with-Pelican-but-tape-can-still-sleep-easy" rel="nofollow">Pelican is being developed and rolled out by Microsoft for its Azure cloud datacentres, and is explicitly only for those that are “not big enough” for tape infrastructure (Azure currently uses IBM TS3500 libraries), according to Russinovich.</a></p></div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://Lyyca-101.github.io">Lyyca-101's fast Blog</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if("11/04/2024"!=""){
+    var startSite=new Date("11/04/2024");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行"+diffDay+"天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","Lyyca-101/Lyyca-101.github.io");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+
+
+</script>
+
+
+</html>
