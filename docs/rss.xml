@@ -1,5 +1,26 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Lyyca-101's fast Blog</title><link>https://Lyyca-101.github.io</link><description>fast blog site</description><copyright>Lyyca-101's fast Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://Lyyca-101.github.io</link></image><lastBuildDate>Mon, 18 Nov 2024 13:34:54 +0000</lastBuildDate><managingEditor>Lyyca-101's fast Blog</managingEditor><ttl>60</ttl><webMaster>Lyyca-101's fast Blog</webMaster><item><title>[XV6 Lab1]TAB completion and command history</title><link>https://Lyyca-101.github.io/post/%5BXV6%20Lab1%5DTAB%20completion%20and%20command%20history.html</link><description>&lt;h1 &gt;关于XV6 Lab1的shell tab completion challenge&lt;/h1&gt;&#13;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Lyyca-101's fast Blog</title><link>https://Lyyca-101.github.io</link><description>fast blog site</description><copyright>Lyyca-101's fast Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://github.githubassets.com/favicons/favicon.svg</url><title>avatar</title><link>https://Lyyca-101.github.io</link></image><lastBuildDate>Tue, 19 Nov 2024 13:31:53 +0000</lastBuildDate><managingEditor>Lyyca-101's fast Blog</managingEditor><ttl>60</ttl><webMaster>Lyyca-101's fast Blog</webMaster><item><title>[FAST2016]The Composite-file File System: Decoupling the One-to-One Mapping of Files and Metadata for Better Performance</title><link>https://Lyyca-101.github.io/post/%5BFAST2016%5DThe%20Composite-file%20File%20System-%20Decoupling%20the%20One-to-One%20Mapping%20of%20Files%20and%20Metadata%20for%20Better%20Performance.html</link><description>&lt;h2&gt;[FAST2016]The Composite-file File System:&#13;
+Decoupling the One-to-One Mapping&#13;
+of Files and Metadata for Better Performance&lt;/h2&gt;&#13;
+&#13;
+现状：&#13;
+&#13;
+- 每个逻辑文件都被映射到它自己的一个物理元数据以及数据表示&#13;
+- 也就是一个1-to-1的文件-元数据映射&#13;
+- 对很多的文件系统机制而言，这是一个自然的粒度(granularity)&#13;
+&#13;
+根据作者的观察(observation)，这种1-to-1的映射可能错失了很多优化的机会，主要的观察有四个：&#13;
+&#13;
+- 对小文件的频繁访问：作者的桌面文件系统分析表明，&gt;80%的访问落在大小&lt;32B的小文件上，而在对这些盘上的小文件数据的访问时间中，对元数据的访问时间占了40%，因此，减少这部分的访问开销将带来巨大的性能提升&#13;
+- 冗余的元数据信息：传统文件关联的元数据，会记录文件的数据块位置、访问权限等，许多文件其实拥有相同或类似的文件属性，对于一些文件属性(访问权限、所有者等)，其可能情况是明显有限的，因此会有大量的文件在这些属性上相似，一个研究表明，对一个工作站的元数据进行压缩，压缩率达到75%(per-inode,128B--&gt;15-20B)，有很多机会去减少冗余的元数据，从而提高空间利用率&#13;
+- 成组访问文件：很多研究表明，文件倾向于被一起访问，但是仅仅将文件分组并不能得到性能提升，应为识别可分租的文件以及将文件分组会带来额外的开销&#13;
+- 预取的局限：尽管预取是一个有效的优化手段，但是提取文件数据-文件元数据的分离动作会导致极大的额外开销，比如，32个小文件和1个和32个小文件一样大的单文件，访问前者的延迟会比后者高50%，哪怕是在已经被缓存的情况下&#13;
+&#13;
+那么，如何减少对元数据的额外访问开销，减少相似元数据占用的空间，低开销地成组访问文件，作者提出一个idea，同时地去解决这些问题，即：&#13;
+&#13;
+- 将一起访问的小文件组合在一起，解耦1-to-1的文件-元数据映射，构造many-to-1的文件-元数据映射&#13;
+&#13;
+作者的设计：。</description><guid isPermaLink="true">https://Lyyca-101.github.io/post/%5BFAST2016%5DThe%20Composite-file%20File%20System-%20Decoupling%20the%20One-to-One%20Mapping%20of%20Files%20and%20Metadata%20for%20Better%20Performance.html</guid><pubDate>Tue, 19 Nov 2024 13:31:31 +0000</pubDate></item><item><title>[XV6 Lab1]TAB completion and command history</title><link>https://Lyyca-101.github.io/post/%5BXV6%20Lab1%5DTAB%20completion%20and%20command%20history.html</link><description>&lt;h1 &gt;关于XV6 Lab1的shell tab completion challenge&lt;/h1&gt;&#13;
 首先得想办法让terminal能够不回显tab&lt;br&gt;&#13;
 其次是参考GNU readline library，其中有非常成熟的命令补全以及命令历史记录的实现&lt;br&gt;&#13;
 实际上，很多的shell、一些工具的命令行模式，都使用了这个库&lt;br&gt;&#13;
